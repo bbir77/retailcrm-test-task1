@@ -4,46 +4,37 @@ const axios = require('axios');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-async function sendTelegramMessage(order, sum) {
-    const message = `
-🚀 *Крупный заказ!*
-💰 Сумма: *${sum} ₸*
-🔢 Номер: ${order.number}
-👤 Клиент: ${order.firstName || 'Не указано'}
-    `;
-    const url = `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`;
-    try {
-        await axios.post(url, {
-            chat_id: process.env.TELEGRAM_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown'
-        });
-        console.log(`✅ Уведомление в Telegram отправлено! (#${order.number})`);
-    } catch (err) {
-        console.error('❌ Ошибка Telegram:', err.message);
-    }
-}
-
 async function syncOrders() {
     try {
-        console.log('--- Запуск синхронизации ---');
+        console.log(`\n[${new Date().toLocaleTimeString()}] 🔍 Подключаюсь к CRM...`);
 
-        const response = await axios.get(`${process.env.RETAILCRM_URL}/api/v5/orders`, {
-            params: { apiKey: process.env.RETAILCRM_KEY, limit: 20 }
+        // 1. Спрашиваем у CRM: "Сколько всего у нас страниц с заказами?"
+        const firstRequest = await axios.get(`${process.env.RETAILCRM_URL}/api/v5/orders`, {
+            params: { apiKey: process.env.RETAILCRM_KEY, limit: 100 }
         });
 
-        const orders = response.data.orders;
-        console.log(`📦 Получено заказов: ${orders.length}`);
+        const totalPages = firstRequest.data.pagination.totalPageCount;
 
+        // 2. Идем сразу на ПОСЛЕДНЮЮ страницу, где лежат новые заказы
+        const lastRequest = await axios.get(`${process.env.RETAILCRM_URL}/api/v5/orders`, {
+            params: { apiKey: process.env.RETAILCRM_KEY, limit: 100, page: totalPages }
+        });
+
+        const orders = lastRequest.data.orders;
+        if (!orders || orders.length === 0) return;
+
+        // Выводим в терминал 3 самых последних заказа, чтобы ты их видел
+        const last3 = orders.slice(-3);
+        console.log(`📑 Я на странице ${totalPages}. Вижу последние заказы:`);
+        last3.forEach(o => {
+             console.log(`   👉 Заказ #${o.number} | Сумма: ${o.totalSum || o.total || 0}`);
+        });
+
+        // 3. Проверяем суммы и шлем в Telegram
         for (const order of orders) {
-            // УМНЫЙ ПОИСК СУММЫ: пробуем разные варианты ключей из API
             const sum = order.totalSum || order.total || order.summ || 0;
 
-            console.log(`🔎 Заказ #${order.number}: Сумма = ${sum}`);
-
-            // Ставим порог 10 для теста (потом вернешь 50000)
             if (Number(sum) > 50000) {
-
                 const { data: existing } = await supabase
                     .from('orders')
                     .select('crm_id')
@@ -51,30 +42,34 @@ async function syncOrders() {
                     .maybeSingle();
 
                 if (!existing) {
-                    console.log(`   ✨ Новый заказ! Шлю в TG...`);
-                    await sendTelegramMessage(order, sum);
-                } else {
-                    console.log(`   ⏭ Уже есть в базе.`);
+                    console.log(`🚨 НАШЕЛ НОВЫЙ КРУПНЫЙ ЗАКАЗ #${order.number}! Шлю в Телеграм...`);
+
+                    const msg = `🚀 *НОВЫЙ ЗАКАЗ!*\n💰 Сумма: *${sum} ₸*\n🔢 Номер: ${order.number}`;
+                    await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
+                        chat_id: process.env.TELEGRAM_CHAT_ID, text: msg, parse_mode: 'Markdown'
+                    });
                 }
             }
         }
 
-        // Сохранение в базу
+        // 4. Сохраняем в Supabase
         const ordersToInsert = orders.map(o => ({
             crm_id: o.id,
             number: o.number,
             status: o.status,
-            total_sum: o.totalSum || o.total || 0, // Сохраняем найденную сумму
+            total_sum: o.totalSum || o.total || 0,
             customer_name: o.firstName || 'Не указано',
             crm_created_at: o.createdAt
         }));
 
         await supabase.from('orders').upsert(ordersToInsert, { onConflict: 'crm_id' });
-        console.log('✅ База данных обновлена.');
+        console.log('✅ База обновлена.');
 
     } catch (err) {
         console.error('❌ Ошибка:', err.message);
     }
 }
 
+console.log('🚀 Робот запущен! Жду новые заказы...');
 syncOrders();
+setInterval(syncOrders, 20000); // Проверка каждые 20 секунд
